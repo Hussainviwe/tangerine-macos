@@ -156,11 +156,12 @@ public struct ToolRegistry {
 
         case .spreadsheet:
             var list: [RadialAction] = [
+                RadialAction(id: "sheet_pdf", title: "PDF", description: "Print spreadsheet to PDF", sfSymbol: "doc.text.fill", mode: .convert, targetExtension: "pdf"),
                 RadialAction(id: "sheet_xlsx", title: "XLSX", description: "Convert to modern Excel XLSX", sfSymbol: "tablecells.fill", mode: .convert, targetExtension: "xlsx"),
-                RadialAction(id: "sheet_ods", title: "ODS", description: "Convert to OpenDocument ODS", sfSymbol: "doc.plaintext", mode: .convert, targetExtension: "ods"),
                 RadialAction(id: "sheet_csv", title: "CSV", description: "Export sheet as standard CSV", sfSymbol: "tablecells", mode: .convert, targetExtension: "csv"),
                 RadialAction(id: "sheet_tsv", title: "TSV", description: "Export sheet as tab-separated TSV", sfSymbol: "tablecells.badge.ellipsis", mode: .convert, targetExtension: "tsv"),
-                RadialAction(id: "sheet_pdf", title: "PDF", description: "Print spreadsheet to PDF", sfSymbol: "doc.text.fill", mode: .convert, targetExtension: "pdf")
+                RadialAction(id: "sheet_html", title: "HTML", description: "Export sheet as web HTML table", sfSymbol: "chevron.left.forwardslash.chevron.right", mode: .convert, targetExtension: "html"),
+                RadialAction(id: "sheet_ods", title: "ODS", description: "Convert to OpenDocument ODS", sfSymbol: "doc.plaintext", mode: .convert, targetExtension: "ods")
             ]
             list.removeAll { $0.targetExtension == firstExt }
             return list

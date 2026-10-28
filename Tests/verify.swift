@@ -165,6 +165,47 @@ struct TestRunner {
             exit(1)
         }
 
+        // 6. Real offline XLSX to PDF & CSV conversion
+        print("  Testing offline XLSX to PDF & CSV conversion...")
+        let xlsxUrl = tempDir.appendingPathComponent("test_sheet.xlsx")
+        let sampleRows: [[String]] = [
+            ["Item", "Quantity", "Price", "Total"],
+            ["Apples", "10", "$2.50", "$25.00"],
+            ["Oranges", "5", "$3.00", "$15.00"],
+            ["Tangerines", "20", "$1.50", "$30.00"]
+        ]
+        _ = try ConversionEngine.writeXLSX(rows: sampleRows, to: xlsxUrl)
+        assertTrue(FileManager.default.fileExists(atPath: xlsxUrl.path), "Generated XLSX should exist")
+
+        let sheetPdfAction = RadialAction(id: "sheet_pdf", title: "PDF", description: "Print to PDF", sfSymbol: "doc.text.fill", mode: .convert, targetExtension: "pdf")
+        let sheetPdfRes = await ConversionEngine.shared.execute(action: sheetPdfAction, urls: [xlsxUrl])
+        switch sheetPdfRes {
+        case .success(let outUrls, _):
+            guard let pdfOut = outUrls.first else { exit(1) }
+            assertTrue(FileManager.default.fileExists(atPath: pdfOut.path), "Output PDF file should exist")
+            assertTrue(pdfOut.pathExtension == "pdf", "Extension should be pdf")
+            let size = (try? Data(contentsOf: pdfOut).count) ?? 0
+            assertTrue(size > 0, "PDF should have content")
+            print("  ✔ Real XLSX -> PDF conversion succeeded.")
+        case .failure(let err):
+            print("❌ XLSX -> PDF failed: \(err)")
+            exit(1)
+        }
+
+        let sheetCsvAction = RadialAction(id: "sheet_csv", title: "CSV", description: "Export CSV", sfSymbol: "tablecells", mode: .convert, targetExtension: "csv")
+        let sheetCsvRes = await ConversionEngine.shared.execute(action: sheetCsvAction, urls: [xlsxUrl])
+        switch sheetCsvRes {
+        case .success(let outUrls, _):
+            guard let csvOut = outUrls.first else { exit(1) }
+            assertTrue(FileManager.default.fileExists(atPath: csvOut.path), "Output CSV file should exist")
+            let csvText = (try? String(contentsOf: csvOut, encoding: .utf8)) ?? ""
+            assertTrue(csvText.contains("Tangerines"), "CSV should contain table data")
+            print("  ✔ Real XLSX -> CSV conversion succeeded.")
+        case .failure(let err):
+            print("❌ XLSX -> CSV failed: \(err)")
+            exit(1)
+        }
+
         print("\n🎉 ALL TESTS PASSED! Everything is working correctly!")
     }
 }

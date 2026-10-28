@@ -523,6 +523,10 @@ public final class ConversionEngine: Sendable {
             throw NSError(domain: "Tangerine", code: 400, userInfo: [NSLocalizedDescriptionKey: "Failed to load PDF document"])
         }
 
+        if pdfDoc.isLocked {
+            throw NSError(domain: "Tangerine", code: 403, userInfo: [NSLocalizedDescriptionKey: "PDF document is password protected or encrypted"])
+        }
+
         let combined = NSMutableAttributedString()
         let pageCount = pdfDoc.pageCount
 
@@ -580,21 +584,43 @@ public final class ConversionEngine: Sendable {
 
         case "docx", "pages":
             let actualOut = ext == "pages" ? destinationURL(for: pdfUrl, newExtension: "docx") : outUrl
-            return try convertViaTextutil(attributed: combined, to: "docx", outUrl: actualOut)
+            do {
+                let docxData = try combined.data(
+                    from: NSRange(location: 0, length: combined.length),
+                    documentAttributes: [.documentType: NSAttributedString.DocumentType.officeOpenXML]
+                )
+                try docxData.write(to: actualOut)
+                return actualOut
+            } catch {
+                return try convertViaTextutil(attributed: combined, to: "docx", outUrl: actualOut)
+            }
 
         case "rtf":
-            let rtfData = try combined.data(
-                from: NSRange(location: 0, length: combined.length),
-                documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
-            )
-            try rtfData.write(to: outUrl)
-            return outUrl
+            do {
+                let rtfData = try combined.data(
+                    from: NSRange(location: 0, length: combined.length),
+                    documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
+                )
+                try rtfData.write(to: outUrl)
+                return outUrl
+            } catch {
+                return try convertViaTextutil(attributed: combined, to: "rtf", outUrl: outUrl)
+            }
 
         case "odt":
             return try convertViaTextutil(attributed: combined, to: "odt", outUrl: outUrl)
 
         case "html", "htm":
-            return try convertViaTextutil(attributed: combined, to: "html", outUrl: outUrl)
+            do {
+                let htmlData = try combined.data(
+                    from: NSRange(location: 0, length: combined.length),
+                    documentAttributes: [.documentType: NSAttributedString.DocumentType.html]
+                )
+                try htmlData.write(to: outUrl)
+                return outUrl
+            } catch {
+                return try convertViaTextutil(attributed: combined, to: "html", outUrl: outUrl)
+            }
 
         case "txt":
             try combined.string.write(to: outUrl, atomically: true, encoding: .utf8)
@@ -607,7 +633,7 @@ public final class ConversionEngine: Sendable {
             return outUrl
 
         case "xlsx", "csv":
-            let lines = combined.string.components(separatedBy: .newlines)
+            let lines = combined.string.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
             let csv = lines.map { "\"\($0.replacingOccurrences(of: "\"", with: "\"\""))\"" }.joined(separator: "\n")
             let csvUrl = destinationURL(for: pdfUrl, newExtension: "csv")
             try csv.write(to: csvUrl, atomically: true, encoding: .utf8)
@@ -621,20 +647,19 @@ public final class ConversionEngine: Sendable {
     private func extractTextWithOCR(from page: PDFPage) -> String {
         let pageRect = page.bounds(for: .mediaBox)
         let scale: CGFloat = 2.0
-        let size = CGSize(width: max(pageRect.width * scale, 100), height: max(pageRect.height * scale, 100))
-
-        let image = NSImage(size: size, flipped: false) { rect in
-            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
-            ctx.setFillColor(NSColor.white.cgColor)
-            ctx.fill(rect)
-            ctx.saveGState()
-            ctx.scaleBy(x: scale, y: scale)
-            page.draw(with: .mediaBox, to: ctx)
-            ctx.restoreGState()
-            return true
+        let width = max(Int(pageRect.width * scale), 100)
+        let height = max(Int(pageRect.height * scale), 100)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            return ""
         }
 
-        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
+        context.setFillColor(NSColor.white.cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.scaleBy(x: scale, y: scale)
+        page.draw(with: .mediaBox, to: context)
+
+        guard let cgImage = context.makeImage() else {
             return ""
         }
 
@@ -656,10 +681,14 @@ public final class ConversionEngine: Sendable {
         let tempRtfUrl = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".rtf")
         defer { try? FileManager.default.removeItem(at: tempRtfUrl) }
 
-        let rtfData = try attributed.data(
-            from: NSRange(location: 0, length: attributed.length),
-            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
-        )
+        let rtfData: Data
+        if let data = try? attributed.data(from: NSRange(location: 0, length: attributed.length), documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]) {
+            rtfData = data
+        } else {
+            // Strip complex PDF attributes that RTF serializer chokes on
+            let clean = NSAttributedString(string: attributed.string, attributes: [.font: NSFont.systemFont(ofSize: 12)])
+            rtfData = try clean.data(from: NSRange(location: 0, length: clean.length), documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf])
+        }
         try rtfData.write(to: tempRtfUrl)
 
         let process = Process()
@@ -914,23 +943,472 @@ public final class ConversionEngine: Sendable {
     }
 
     private func convertSpreadsheet(sourceUrl: URL, targetExtension: String) throws -> URL {
-        let text = try String(contentsOf: sourceUrl, encoding: .utf8)
-        let outUrl = destinationURL(for: sourceUrl, newExtension: targetExtension)
         let ext = targetExtension.lowercased()
+        let srcExt = sourceUrl.pathExtension.lowercased()
+        let outUrl = destinationURL(for: sourceUrl, newExtension: ext)
 
-        if ext == "tsv" {
-            let tsv = text.replacingOccurrences(of: ",", with: "\t")
-            try tsv.write(to: outUrl, atomically: true, encoding: .utf8)
-            return outUrl
-        } else if ext == "csv" {
-            let csv = text.replacingOccurrences(of: "\t", with: ",")
-            try csv.write(to: outUrl, atomically: true, encoding: .utf8)
-            return outUrl
-        } else if ext == "pdf" {
-            return try convertDocument(sourceUrl: sourceUrl, targetExtension: "pdf")
-        } else {
-            return try convertDocument(sourceUrl: sourceUrl, targetExtension: targetExtension)
+        // 1. Export spreadsheet to PDF
+        if ext == "pdf" {
+            return try exportSpreadsheetToPDF(sourceUrl: sourceUrl, outUrl: outUrl)
         }
+
+        // 2. Export to CSV or TSV
+        if ext == "csv" || ext == "tsv" {
+            return try exportSpreadsheetToDelimited(sourceUrl: sourceUrl, outUrl: outUrl, isTSV: ext == "tsv")
+        }
+
+        // 3. Export to HTML or Markdown
+        if ext == "html" || ext == "htm" || ext == "md" || ext == "markdown" {
+            let rows = try extractSpreadsheetRows(sourceUrl: sourceUrl)
+            if ext == "md" || ext == "markdown" {
+                return try exportRowsToMarkdown(rows: rows, sourceUrl: sourceUrl, outUrl: outUrl)
+            } else {
+                return try exportRowsToHTML(rows: rows, sourceUrl: sourceUrl, outUrl: outUrl)
+            }
+        }
+
+        // 4. Export to XLSX
+        if ext == "xlsx" {
+            return try exportSpreadsheetToXLSX(sourceUrl: sourceUrl, outUrl: outUrl)
+        }
+
+        // 5. Fallback for other formats (e.g. ODS, TXT)
+        if srcExt == "csv" || srcExt == "tsv" {
+            let text = (try? String(contentsOf: sourceUrl, encoding: .utf8)) ??
+                       (try? String(contentsOf: sourceUrl, encoding: .isoLatin1)) ?? ""
+            let attr = NSAttributedString(string: text, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)])
+            return try convertViaTextutil(attributed: attr, to: ext, outUrl: outUrl)
+        }
+
+        let rows = try extractSpreadsheetRows(sourceUrl: sourceUrl)
+        let htmlUrl = try exportRowsToHTML(rows: rows, sourceUrl: sourceUrl, outUrl: destinationURL(for: sourceUrl, newExtension: "html", suffix: "-temp"))
+        defer { try? FileManager.default.removeItem(at: htmlUrl) }
+        return try convertDocument(sourceUrl: htmlUrl, targetExtension: ext)
+    }
+
+    private func exportSpreadsheetToPDF(sourceUrl: URL, outUrl: URL) throws -> URL {
+        let srcExt = sourceUrl.pathExtension.lowercased()
+
+        // For binary spreadsheets (.xlsx, .xls, .numbers, .ods), try macOS QuickLook engine first
+        if srcExt != "csv" && srcExt != "tsv" {
+            if let qlPdf = tryQuickLookPDF(sourceUrl: sourceUrl, outUrl: outUrl) {
+                return qlPdf
+            }
+        }
+
+        // Fallback: extract table rows natively and render styled PDF table
+        let rows = try extractSpreadsheetRows(sourceUrl: sourceUrl)
+        let htmlContent = generateStyledHTMLTable(rows: rows, title: sourceUrl.deletingPathExtension().lastPathComponent)
+        return try renderHTMLToPDF(html: htmlContent, outUrl: outUrl)
+    }
+
+    private func tryQuickLookPDF(sourceUrl: URL, outUrl: URL) -> URL? {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/qlmanage")
+        p.arguments = ["-p", sourceUrl.path, "-o", tempDir.path]
+        try? p.run()
+        p.waitUntilExit()
+
+        let previewFolder = tempDir.appendingPathComponent("\(sourceUrl.lastPathComponent).qlpreview")
+        guard FileManager.default.fileExists(atPath: previewFolder.path) else { return nil }
+
+        // Check if QuickLook directly produced a Preview.pdf
+        let previewPdf = previewFolder.appendingPathComponent("Preview.pdf")
+        if FileManager.default.fileExists(atPath: previewPdf.path) {
+            try? FileManager.default.removeItem(at: outUrl)
+            if (try? FileManager.default.copyItem(at: previewPdf, to: outUrl)) != nil {
+                return outUrl
+            }
+        }
+
+        // Check if QuickLook produced a Preview.html
+        let previewHtml = previewFolder.appendingPathComponent("Preview.html")
+        if FileManager.default.fileExists(atPath: previewHtml.path),
+           let htmlData = try? Data(contentsOf: previewHtml),
+           let htmlString = String(data: htmlData, encoding: .utf8),
+           let pdfOut = try? renderHTMLToPDF(html: htmlString, outUrl: outUrl) {
+            return pdfOut
+        }
+
+        return nil
+    }
+
+    private func renderHTMLToPDF(html: String, outUrl: URL) throws -> URL {
+        guard let data = html.data(using: .utf8) else {
+            throw NSError(domain: "Tangerine", code: 400, userInfo: [NSLocalizedDescriptionKey: "Failed to encode spreadsheet HTML"])
+        }
+
+        let attr = try NSAttributedString(
+            data: data,
+            options: [.documentType: NSAttributedString.DocumentType.html],
+            documentAttributes: nil
+        )
+
+        return try exportAttributedStringToPDF(attr: attr, outUrl: outUrl)
+    }
+
+    private func extractSpreadsheetRows(sourceUrl: URL) throws -> [[String]] {
+        let srcExt = sourceUrl.pathExtension.lowercased()
+
+        if srcExt == "csv" || srcExt == "tsv" {
+            let text = (try? String(contentsOf: sourceUrl, encoding: .utf8)) ??
+                       (try? String(contentsOf: sourceUrl, encoding: .isoLatin1)) ?? ""
+            return parseCSVRows(text: text, isTSV: srcExt == "tsv")
+        }
+
+        if srcExt == "xlsx" {
+            if let rows = try? parseXLSXRows(sourceUrl: sourceUrl), !rows.isEmpty {
+                return rows
+            }
+        }
+
+        // Try extracting from QuickLook Preview.html for numbers, xls, ods, etc.
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/qlmanage")
+        p.arguments = ["-p", sourceUrl.path, "-o", tempDir.path]
+        try? p.run()
+        p.waitUntilExit()
+
+        let previewHtml = tempDir.appendingPathComponent("\(sourceUrl.lastPathComponent).qlpreview/Preview.html")
+        if FileManager.default.fileExists(atPath: previewHtml.path),
+           let htmlData = try? Data(contentsOf: previewHtml),
+           let htmlDoc = try? XMLDocument(data: htmlData, options: [.documentTidyHTML]),
+           let tableRows = try? htmlDoc.nodes(forXPath: "//tr") {
+            var extracted: [[String]] = []
+            for tr in tableRows {
+                var rowVals: [String] = []
+                if let cells = try? tr.nodes(forXPath: ".//th | .//td") {
+                    for cell in cells {
+                        let text = cell.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        rowVals.append(text)
+                    }
+                }
+                if !rowVals.isEmpty {
+                    extracted.append(rowVals)
+                }
+            }
+            if !extracted.isEmpty {
+                return extracted
+            }
+        }
+
+        // Last resort: raw text lines
+        if let raw = try? String(contentsOf: sourceUrl, encoding: .utf8) {
+            return parseCSVRows(text: raw, isTSV: false)
+        }
+
+        throw NSError(domain: "Tangerine", code: 400, userInfo: [NSLocalizedDescriptionKey: "Failed to read spreadsheet contents"])
+    }
+
+    private func parseXLSXRows(sourceUrl: URL) throws -> [[String]] {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        p.arguments = ["-x", "-k", sourceUrl.path, tempDir.path]
+        try p.run()
+        p.waitUntilExit()
+
+        // 1. Parse sharedStrings.xml
+        let stringsUrl = tempDir.appendingPathComponent("xl/sharedStrings.xml")
+        var sharedStrings: [String] = []
+        if let doc = try? XMLDocument(contentsOf: stringsUrl, options: []) {
+            if let siNodes = try? doc.nodes(forXPath: "//si") {
+                for node in siNodes {
+                    let text = node.stringValue ?? ""
+                    sharedStrings.append(text)
+                }
+            }
+        }
+
+        // 2. Parse sheet1.xml
+        let sheetUrl = tempDir.appendingPathComponent("xl/worksheets/sheet1.xml")
+        guard let doc = try? XMLDocument(contentsOf: sheetUrl, options: []),
+              let rowNodes = try? doc.nodes(forXPath: "//row") else {
+            return []
+        }
+
+        var result: [[String]] = []
+        for rowNode in rowNodes {
+            var rowMap: [Int: String] = [:]
+            var maxCol = 0
+
+            if let cells = try? rowNode.nodes(forXPath: "c") {
+                for cell in cells {
+                    guard let cellElem = cell as? XMLElement else { continue }
+                    let cellRef = cellElem.attribute(forName: "r")?.stringValue ?? ""
+                    let colLetters = cellRef.filter { $0.isLetter }.uppercased()
+                    var colIndex = 0
+                    for ch in colLetters.utf8 {
+                        colIndex = colIndex * 26 + Int(ch - 64)
+                    }
+                    colIndex = max(colIndex - 1, 0)
+                    maxCol = max(maxCol, colIndex)
+
+                    let isShared = cellElem.attribute(forName: "t")?.stringValue == "s"
+                    let val = (try? cell.nodes(forXPath: "v"))?.first?.stringValue ??
+                              (try? cell.nodes(forXPath: "is/t"))?.first?.stringValue ?? ""
+
+                    if isShared, let idx = Int(val), idx < sharedStrings.count {
+                        rowMap[colIndex] = sharedStrings[idx]
+                    } else {
+                        rowMap[colIndex] = val
+                    }
+                }
+            }
+
+            var rowArray: [String] = []
+            for col in 0...maxCol {
+                rowArray.append(rowMap[col] ?? "")
+            }
+            if !rowArray.allSatisfy({ $0.isEmpty }) {
+                result.append(rowArray)
+            }
+        }
+
+        return result
+    }
+
+    private func parseCSVRows(text: String, isTSV: Bool) -> [[String]] {
+        let lines = text.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        let sep: Character = isTSV ? "\t" : ","
+        return lines.map { line in
+            var fields: [String] = []
+            var current = ""
+            var inQuotes = false
+            for ch in line {
+                if ch == "\"" {
+                    inQuotes.toggle()
+                } else if ch == sep && !inQuotes {
+                    fields.append(current.trimmingCharacters(in: .whitespaces))
+                    current = ""
+                } else {
+                    current.append(ch)
+                }
+            }
+            fields.append(current.trimmingCharacters(in: .whitespaces))
+            return fields
+        }
+    }
+
+    private func generateStyledHTMLTable(rows: [[String]], title: String) -> String {
+        var html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+        <meta charset="utf-8">
+        <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 36px; color: #1f2328; }
+        h1 { font-size: 18px; margin-bottom: 12px; font-weight: 700; color: #0969da; }
+        table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 11px; }
+        th, td { border: 1px solid #d0d7de; padding: 6px 10px; text-align: left; }
+        th { background-color: #f6f8fa; font-weight: 600; color: #24292f; }
+        tr:nth-child(even) td { background-color: #fcfcfc; }
+        </style>
+        </head>
+        <body>
+        <h1>\(title)</h1>
+        <table>
+        """
+
+        for (i, row) in rows.enumerated() {
+            html += "<tr>"
+            let tag = (i == 0) ? "th" : "td"
+            for cell in row {
+                let escaped = cell.replacingOccurrences(of: "&", with: "&amp;")
+                                  .replacingOccurrences(of: "<", with: "&lt;")
+                                  .replacingOccurrences(of: ">", with: "&gt;")
+                html += "<\(tag)>\(escaped)</\(tag)>"
+            }
+            html += "</tr>\n"
+        }
+
+        html += """
+        </table>
+        </body>
+        </html>
+        """
+        return html
+    }
+
+    private func exportSpreadsheetToDelimited(sourceUrl: URL, outUrl: URL, isTSV: Bool) throws -> URL {
+        let rows = try extractSpreadsheetRows(sourceUrl: sourceUrl)
+        let sep = isTSV ? "\t" : ","
+        let content = rows.map { row in
+            row.map { val in
+                if isTSV {
+                    return val.replacingOccurrences(of: "\t", with: " ")
+                } else {
+                    return "\"\(val.replacingOccurrences(of: "\"", with: "\"\""))\""
+                }
+            }.joined(separator: sep)
+        }.joined(separator: "\n")
+
+        try content.write(to: outUrl, atomically: true, encoding: .utf8)
+        return outUrl
+    }
+
+    private func exportRowsToHTML(rows: [[String]], sourceUrl: URL, outUrl: URL) throws -> URL {
+        let title = sourceUrl.deletingPathExtension().lastPathComponent
+        let html = generateStyledHTMLTable(rows: rows, title: title)
+        try html.write(to: outUrl, atomically: true, encoding: .utf8)
+        return outUrl
+    }
+
+    private func exportRowsToMarkdown(rows: [[String]], sourceUrl: URL, outUrl: URL) throws -> URL {
+        let title = sourceUrl.deletingPathExtension().lastPathComponent
+        var md = "# \(title)\n\n"
+        guard let first = rows.first else {
+            try md.write(to: outUrl, atomically: true, encoding: .utf8)
+            return outUrl
+        }
+
+        md += "| " + first.joined(separator: " | ") + " |\n"
+        md += "| " + first.map { _ in "---" }.joined(separator: " | ") + " |\n"
+
+        for row in rows.dropFirst() {
+            let padded = row + Array(repeating: "", count: max(0, first.count - row.count))
+            md += "| " + padded.prefix(first.count).joined(separator: " | ") + " |\n"
+        }
+
+        try md.write(to: outUrl, atomically: true, encoding: .utf8)
+        return outUrl
+    }
+
+    private func exportSpreadsheetToXLSX(sourceUrl: URL, outUrl: URL) throws -> URL {
+        let rows = try extractSpreadsheetRows(sourceUrl: sourceUrl)
+        return try Self.writeXLSX(rows: rows, to: outUrl)
+    }
+
+    public static func writeXLSX(rows: [[String]], to outUrl: URL) throws -> URL {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let xlDir = tempDir.appendingPathComponent("xl")
+        let sheetsDir = xlDir.appendingPathComponent("worksheets")
+        let relsDir = tempDir.appendingPathComponent("_rels")
+        let xlRelsDir = xlDir.appendingPathComponent("_rels")
+
+        try FileManager.default.createDirectory(at: sheetsDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: relsDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: xlRelsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // 1. [Content_Types].xml
+        let contentTypes = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+          <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+          <Default Extension="xml" ContentType="application/xml"/>
+          <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+          <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+          <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+        </Types>
+        """
+        try contentTypes.write(to: tempDir.appendingPathComponent("[Content_Types].xml"), atomically: true, encoding: .utf8)
+
+        // 2. _rels/.rels
+        let rels = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+        </Relationships>
+        """
+        try rels.write(to: relsDir.appendingPathComponent(".rels"), atomically: true, encoding: .utf8)
+
+        // 3. xl/_rels/workbook.xml.rels
+        let wbRels = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+          <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+        </Relationships>
+        """
+        try wbRels.write(to: xlRelsDir.appendingPathComponent("workbook.xml.rels"), atomically: true, encoding: .utf8)
+
+        // 4. xl/workbook.xml
+        let wb = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+        </workbook>
+        """
+        try wb.write(to: xlDir.appendingPathComponent("workbook.xml"), atomically: true, encoding: .utf8)
+
+        // 5. Gather strings & build sheet1.xml
+        var stringTable: [String: Int] = [:]
+        var stringArray: [String] = []
+
+        var sheetXml = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+          <sheetData>
+        """
+
+        for (rIdx, row) in rows.enumerated() {
+            let rowNum = rIdx + 1
+            sheetXml += "<row r=\"\(rowNum)\">"
+            for (cIdx, cellVal) in row.enumerated() {
+                var colLetter = ""
+                var num = cIdx + 1
+                while num > 0 {
+                    let rem = (num - 1) % 26
+                    colLetter = String(UnicodeScalar(65 + rem)!) + colLetter
+                    num = (num - 1) / 26
+                }
+                let cellRef = "\(colLetter)\(rowNum)"
+
+                if let numVal = Double(cellVal), !cellVal.contains(" ") {
+                    sheetXml += "<c r=\"\(cellRef)\"><v>\(numVal)</v></c>"
+                } else {
+                    let sIdx: Int
+                    if let existing = stringTable[cellVal] {
+                        sIdx = existing
+                    } else {
+                        sIdx = stringArray.count
+                        stringTable[cellVal] = sIdx
+                        stringArray.append(cellVal)
+                    }
+                    sheetXml += "<c r=\"\(cellRef)\" t=\"s\"><v>\(sIdx)</v></c>"
+                }
+            }
+            sheetXml += "</row>"
+        }
+        sheetXml += "</sheetData></worksheet>"
+        try sheetXml.write(to: sheetsDir.appendingPathComponent("sheet1.xml"), atomically: true, encoding: .utf8)
+
+        // 6. xl/sharedStrings.xml
+        var ssXml = """
+        <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="\(stringArray.count)" uniqueCount="\(stringArray.count)">
+        """
+        for str in stringArray {
+            let escaped = str.replacingOccurrences(of: "&", with: "&amp;")
+                             .replacingOccurrences(of: "<", with: "&lt;")
+                             .replacingOccurrences(of: ">", with: "&gt;")
+            ssXml += "<si><t>\(escaped)</t></si>"
+        }
+        ssXml += "</sst>"
+        try ssXml.write(to: xlDir.appendingPathComponent("sharedStrings.xml"), atomically: true, encoding: .utf8)
+
+        // 7. Zip to outUrl using ditto
+        try? FileManager.default.removeItem(at: outUrl)
+        let zipProc = Process()
+        zipProc.currentDirectoryURL = tempDir
+        zipProc.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
+        zipProc.arguments = ["-q", "-r", outUrl.path, "."]
+        try zipProc.run()
+        zipProc.waitUntilExit()
+
+        return outUrl
     }
 
     // MARK: - Native Helpers: Documents & textutil

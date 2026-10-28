@@ -56,6 +56,16 @@ public struct DemoFileItem: Identifiable {
                     ctx.closePDF()
                     try? (pdfData as Data).write(to: fileUrl)
                 }
+            } else if ext == "xlsx" {
+                // Generate a real sample XLSX workbook
+                let sampleRows: [[String]] = [
+                    ["Quarter", "Revenue", "Expenses", "Net Profit"],
+                    ["Q1 2026", "$125000", "$82000", "$43000"],
+                    ["Q2 2026", "$148000", "$89000", "$59000"],
+                    ["Q3 2026", "$165000", "$95000", "$70000"],
+                    ["Q4 2026", "$192000", "$104000", "$88000"]
+                ]
+                _ = try? ConversionEngine.writeXLSX(rows: sampleRows, to: fileUrl)
             } else if ext == "zip" {
                 // Generate real ZIP archive
                 let subDir = tempDir.appendingPathComponent(UUID().uuidString)
@@ -87,6 +97,7 @@ public struct FloatingDropZoneView: View {
         DemoFileItem(name: "podcast-episode", ext: "mp3", category: .audio, size: "8.1 MB"),
         DemoFileItem(name: "annual-report", ext: "pdf", category: .pdf, size: "1.5 MB"),
         DemoFileItem(name: "brief-overview", ext: "docx", category: .document, size: "420 KB"),
+        DemoFileItem(name: "quarterly-budget", ext: "xlsx", category: .spreadsheet, size: "85 KB"),
         DemoFileItem(name: "project-assets", ext: "zip", category: .archive, size: "12.8 MB")
     ]
 

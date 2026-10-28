@@ -169,13 +169,22 @@ public struct RadialMenuView: View {
         }
         .frame(width: size, height: size)
         .contentShape(Circle())
+        .onContinuousHover { phase in
+            switch phase {
+            case .active(let location):
+                updateHover(at: location)
+            case .ended:
+                appState.hoveredAction = nil
+            }
+        }
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { value in
                     updateHover(at: value.location)
                 }
                 .onEnded { value in
-                    if let action = appState.hoveredAction {
+                    let selected = appState.hoveredAction ?? action(at: value.location)
+                    if let action = selected {
                         appState.executeAction(action)
                     } else {
                         appState.dismissWheel()
@@ -208,7 +217,7 @@ public struct RadialMenuView: View {
         .buttonStyle(.plain)
     }
 
-    private func updateHover(at point: CGPoint) {
+    private func action(at point: CGPoint) -> RadialAction? {
         let center = CGPoint(x: size / 2, y: size / 2)
         let dx = point.x - center.x
         let dy = point.y - center.y
@@ -216,10 +225,7 @@ public struct RadialMenuView: View {
 
         // Inside center circle or outside wheel?
         if distance < innerRadius || distance > outerRadius + 20 {
-            if appState.hoveredAction != nil {
-                appState.hoveredAction = nil
-            }
-            return
+            return nil
         }
 
         let rad = atan2(dy, dx)
@@ -229,15 +235,25 @@ public struct RadialMenuView: View {
         if deg < 0 { deg += 360.0 }
 
         let count = actions.count
-        guard count > 0 else { return }
+        guard count > 0 else { return nil }
         let span = 360.0 / Double(count)
         let index = Int(deg / span) % count
 
         if index >= 0 && index < actions.count {
-            let action = actions[index]
-            if appState.hoveredAction?.id != action.id {
-                appState.hoveredAction = action
+            return actions[index]
+        }
+        return nil
+    }
+
+    private func updateHover(at point: CGPoint) {
+        if let act = action(at: point) {
+            if appState.hoveredAction?.id != act.id {
+                appState.hoveredAction = act
                 NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+            }
+        } else {
+            if appState.hoveredAction != nil {
+                appState.hoveredAction = nil
             }
         }
     }
